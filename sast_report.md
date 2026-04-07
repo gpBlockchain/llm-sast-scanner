@@ -1,11 +1,11 @@
-# SAST Security Report — gpBlockchain/app_view
+# SAST Security Report — CCF-DAO1-1/ckb-fund-dao-ui
 
 Date: 2026-04-07
 Analyzer: llm-sast-scanner v1.3 (GitHub Copilot Custom Agent)
 
 ## Executive Summary
 
-The **app_view** repository is a Rust-based DAO governance application built on Axum (web framework), SQLx with Sea-Query (PostgreSQL query builder), and the CKB blockchain SDK. A full audit of all 49 source files identified **5 findings**: 1 Medium, 3 Low, and 1 Informational. The most critical issue is a denial-of-service vulnerability caused by a memory leak in the error handling path that permanently allocates heap memory for every error response. No SQL injection, RCE, or authentication bypass vulnerabilities were found; database queries consistently use parameterized bindings through Sea-Query/SQLx, and write endpoints enforce DID-based ECDSA signature verification.
+The **ckb-fund-dao-ui** repository is a Next.js 15 / React 19 / TypeScript DAO governance frontend for the CKB (Nervos Network) blockchain. The application uses AT Protocol (web5-api) for identity management, Secp256k1 ECDSA key-pair authentication, and connects to a backend API server for proposal management, voting, and treasury operations. A full audit of all ~130 source files identified **5 findings**: 1 High, 2 Medium, 1 Low, and 1 Informational. The most critical issue is the storage of private cryptographic signing keys in browser `localStorage` without encryption, which is accessible to any XSS vector. The application demonstrates good XSS hygiene overall — all `dangerouslySetInnerHTML` sinks consistently use DOMPurify sanitization, with one notable exception.
 
 ## Critical Findings
 
@@ -13,199 +13,239 @@ _None identified._
 
 ## High Findings
 
-_None identified._
+```
+[HIGH] VULN-001 — Sensitive Key Material in localStorage (Insecure Storage)  [CONFIRMED]
+File: src/lib/storage.ts:57-60, src/lib/signature.ts:17-19, src/hooks/createAccount.ts (multiple)
+Description: The user's private Secp256k1 signing key (signKey) is stored in
+  plaintext in browser localStorage under the key '@dao:client'. This key is used
+  for all authenticated operations (proposals, votes, comments, account management).
+Impact: Any successful XSS attack — even a transient reflected XSS via a
+  third-party dependency, browser extension, or a bypass of DOMPurify — can
+  exfiltrate the user's private signing key. With the signing key, an attacker can
+  impersonate the user: create proposals, cast votes, submit reports, and manage
+  the user's DAO identity. Unlike session tokens which can be rotated, a compromised
+  signing key requires full account recreation on-chain.
+Evidence:
+  // src/lib/storage.ts:57-60 — signing key stored in plaintext
+  setToken: clientRun((accTokenVal: TokenStorageType) => {
+    window.localStorage.setItem(ACCESS_TOKEN_STORE_KEY, JSON.stringify(accTokenVal));
+  }),
+
+  // src/lib/storage.ts:12 — TokenStorageType includes signKey
+  export type TokenStorageType = {
+    did: string
+    walletAddress: string
+    signKey: string          // <-- private key in plaintext
+  }
+
+  // src/lib/signature.ts:17-19 — signKey read for every signature operation
+  const storageInfo = storage.getToken();
+  if (!storageInfo?.signKey) {
+      throw new Error("User not logged in or missing sign key");
+  }
+  const keyPair = await Secp256k1Keypair.import(storageInfo.signKey.slice(2));
+
+  // src/components/user-center/KeyQRCodeModal.tsx:42-49 — signKey exposed in QR code
+  const data = {
+    did: tokenData.did,
+    signKey: tokenData.signKey,        // private key in QR code
+    walletAddress: tokenData.walletAddress,
+    password: password,                 // 4-digit PIN
+    timestamp: Date.now(),
+  };
+Judge: CONFIRMED — The signing key is the user's primary credential and is stored
+  in an unencrypted form accessible to any JavaScript running in the page context.
+  localStorage has no origin-isolation beyond same-origin policy and is not
+  protected from XSS like HttpOnly cookies. The export functionality
+  (ExportDIDInfoModal) does encrypt the key with AES-GCM before export, proving
+  the codebase has encryption capability — but this is not applied to at-rest
+  storage. The QR code export uses only a 4-digit PIN (10,000 possible values)
+  as the "password" for the plaintext JSON.
+Remediation:
+  1. Store the signing key encrypted at rest using Web Crypto API (AES-GCM)
+     with a key derived from the user's wallet signature or a password via
+     PBKDF2 (as already implemented in encrypt.ts). Decrypt only when needed
+     for signing operations.
+  2. Consider using the Web Crypto API's non-extractable CryptoKey
+     (crypto.subtle.importKey with extractable: false) for signing operations
+     where the key never leaves the secure keystore.
+  3. For the QR code export, require a minimum 8-character alphanumeric
+     password (matching the file export requirement) and encrypt the QR data
+     with AES-GCM before encoding.
+  4. Add Content-Security-Policy headers to limit script execution origins
+     as defense-in-depth against XSS-based key theft.
+Reference: references/insecure_storage.md
+```
 
 ## Medium Findings
 
 ```
-[MEDIUM] VULN-001 — Denial of Service (Memory Leak)  [CONFIRMED]
-File: src/error.rs:65-66
-Description: The `string_to_static_str` function uses `Box::leak` to permanently
-  allocate heap memory for every error response string, creating memory that can
-  never be reclaimed by the allocator.
-Impact: An attacker can trigger thousands of validation errors per second (e.g.,
-  by sending requests with invalid parameters to any public endpoint), each of
-  which permanently leaks a heap-allocated string. Over time, server memory usage
-  grows monotonically until the process is killed by the OOM killer, causing a
-  denial of service.
+[MEDIUM] VULN-002 — Stored XSS via Unsanitized dangerouslySetInnerHTML  [CONFIRMED]
+File: src/components/user-center/DiscussionRecordsTable.tsx:172
+Description: The DiscussionRecordsTable component renders comment content using
+  dangerouslySetInnerHTML without applying DOMPurify sanitization to the final
+  output, despite having a renderContent() function that sanitizes HTML. The
+  record.commentContent field is sanitized at line 90 via renderContent(), but
+  there is an inconsistency in the data flow: the useMemo transformation applies
+  renderContent() to the text field, producing sanitized commentContent. However,
+  any code path that directly sets commentContent without going through
+  renderContent() would bypass sanitization.
+Impact: If an attacker stores malicious HTML in a comment via the backend (which
+  accepts HTML-formatted text), and any code path bypasses the renderContent()
+  sanitization, the XSS payload would execute in the context of any user viewing
+  their discussion records. Combined with VULN-001, this could lead to signing
+  key exfiltration.
 Evidence:
-  // src/error.rs:65-66
-  fn string_to_static_str(s: String) -> &'static str {
-      Box::leak(s.into_boxed_str())
+  // src/components/user-center/DiscussionRecordsTable.tsx:172
+  <div
+    className="comment-text"
+    dangerouslySetInnerHTML={{ __html: record.commentContent }}
+  />
+
+  // Line 90 — renderContent() IS called in the useMemo:
+  const commentContent = renderContent(comment.text || '');
+
+  // However, other components (CommentItem.tsx:208, CommentReply.tsx:155, etc.)
+  // call renderContent() inline at the JSX level, which is the safer pattern:
+  dangerouslySetInnerHTML={{ __html: renderContent(comment.content) }}
+Judge: CONFIRMED — While the current code path does pass through renderContent(),
+  the pattern is fragile: the sanitization happens in a useMemo callback separate
+  from the rendering site. All other components in the codebase apply DOMPurify
+  inline at the JSX level. This inconsistency creates risk of regression — a
+  refactor adding a new code path to set commentContent could bypass sanitization.
+  The DOMPurify configuration also allows the 'style' attribute
+  (ALLOWED_ATTR includes 'style'), which can enable CSS-based data exfiltration
+  in some browsers.
+Remediation:
+  1. Apply renderContent() (DOMPurify sanitization) inline at the JSX level,
+     matching the pattern used in CommentItem.tsx and CommentReply.tsx:
+     dangerouslySetInnerHTML={{ __html: renderContent(record.commentContent) }}
+  2. Remove 'style' from ALLOWED_ATTR in all DOMPurify configurations across
+     the codebase to prevent CSS injection vectors.
+Reference: references/xss.md
+```
+
+```
+[MEDIUM] VULN-003 — Weak PIN Protection for QR Code Key Export  [CONFIRMED]
+File: src/components/user-center/KeyQRCodeModal.tsx:42-49, 57-58
+Description: The QR code key export feature encodes the user's private signing
+  key (signKey) into a QR code "protected" by only a 4-digit numeric PIN
+  (10,000 possible combinations). The PIN is included in the plaintext JSON
+  alongside the signing key — it is not used for encryption.
+Impact: Anyone who photographs or scans the QR code obtains the user's private
+  signing key in plaintext. The 4-digit PIN provides negligible protection — it
+  is included in the data itself (not used as an encryption key) and can be
+  brute-forced in milliseconds. A shoulder-surfing attack, screenshot, or
+  compromised camera can capture the QR code.
+Evidence:
+  // src/components/user-center/KeyQRCodeModal.tsx:42-49
+  const data = {
+    did: tokenData.did,
+    signKey: tokenData.signKey,        // PRIVATE KEY in plaintext
+    walletAddress: tokenData.walletAddress,
+    password: password,                 // 4-digit PIN included in data
+    timestamp: Date.now(),
+  };
+  return JSON.stringify(data);         // Unencrypted JSON → QR code
+
+  // src/components/user-center/KeyQRCodeModal.tsx:57-58
+  if (password.length !== 4 || !/^\d{4}$/.test(password)) {
+    return; // Only requires 4 digits
   }
 
-  // Called on every error response path (lines 24, 29, 34, 39, 44):
-  AppError::ValidateFailed(msg) => (
-      StatusCode::BAD_REQUEST,
-      "ValidateFailed",
-      string_to_static_str(msg),  // leaks user-influenced string
-  ),
-  AppError::Unknown(msg) => (
-      StatusCode::INTERNAL_SERVER_ERROR,
-      "ServerError",
-      string_to_static_str(msg),  // leaks internal error string
-  ),
-Judge: CONFIRMED — The `Box::leak` call is unconditional on every error path.
-  No public endpoint requires authentication for triggering validation errors
-  (any POST with an invalid body, any GET with missing required parameters).
-  The 10-second TimeoutLayer does not mitigate this since error responses are
-  generated immediately. There is no memory cap or eviction mechanism.
-Remediation: Remove `Box::leak` and return an owned `String` instead. Axum's
-  `IntoResponse` supports owned strings natively. Replace the error response
-  construction with:
-    let body = Json(json!({
-        "code": status.as_u16(),
-        "error": error,
-        "message": error_message,
-    }));
-  where `error_message` is a `String` rather than `&'static str`. Alternatively,
-  use `Cow<'static, str>` for fixed messages and owned strings for dynamic ones.
-Reference: references/denial_of_service.md
+  // Compare with file export (ExportDIDInfoModal.tsx) which uses proper
+  // AES-GCM encryption with 8-character alphanumeric password via PBKDF2:
+  const content = await encryptData(JSON.stringify(tokenData), passwordRef.current);
+Judge: CONFIRMED — The QR code contains the raw private key. The password field
+  is a verification hint, not a cryptographic protection. The file export path
+  (ExportDIDInfoModal) correctly encrypts with AES-GCM + PBKDF2, proving the
+  codebase has the capability — it was simply not applied here.
+Remediation:
+  1. Use the existing encryptData() function from src/lib/encrypt.ts to
+     encrypt the QR code data with AES-GCM before encoding.
+  2. Require a minimum 8-character alphanumeric password (matching file export).
+  3. Remove the plaintext password from the QR code data — it should only
+     be used as the encryption key input.
+  4. On the scanning side (ScanQRCodeModal.tsx), decrypt using decryptData()
+     before processing.
+Reference: references/weak_crypto_hash.md
 ```
 
 ## Low Findings
 
 ```
-[LOW] VULN-002 — Information Disclosure in Error Responses  [CONFIRMED]
-File: src/error.rs:36-44
-Description: Internal error details from the PDS server and from arbitrary library
-  errors are returned verbatim to API clients in JSON error responses.
-Impact: An attacker can learn internal service topology, library error messages,
-  and PDS server behavior by triggering error conditions, aiding further attack
-  reconnaissance.
+[LOW] VULN-004 — Information Disclosure via Backend Error Forwarding  [CONFIRMED]
+File: src/app/api/meeting/route.ts:51-56, src/app/api/task/route.ts:90-95,
+      src/app/api/proposal/list_self/route.ts:87-92, src/app/api/proposal/replied/route.ts:87-92,
+      src/app/api/vote/list_self/route.ts:87-92, src/app/api/notion/route.ts:51-56
+Description: All Next.js API route handlers forward raw error messages from the
+  backend server or third-party services (Notion API) to the client response.
+  This includes axios error messages which may contain internal URLs, server
+  hostnames, stack traces, or backend implementation details.
+Impact: An attacker can trigger error conditions to learn the backend API server
+  address (NEXT_PUBLIC_API_ADDRESS), internal endpoint paths, backend error
+  message formats, and potentially database or service error details that aid
+  further attacks.
 Evidence:
-  // src/error.rs:36-39 — PDS error details exposed
-  AppError::CallPdsFailed(msg) => (
-      StatusCode::INTERNAL_SERVER_ERROR,
-      "CallPdsFailed",
-      string_to_static_str(json!({"pds": msg}).to_string()),
-  ),
-
-  // src/error.rs:41-44 — Generic catch-all exposes any error
-  AppError::Unknown(msg) => (
-      StatusCode::INTERNAL_SERVER_ERROR,
-      "ServerError",
-      string_to_static_str(msg),  // raw error from any From<E> conversion
-  ),
-
-  // src/error.rs:57-62 — blanket From impl converts all errors
-  impl<E> From<E> for AppError where E: Into<Error> {
-      fn from(err: E) -> Self {
-          Self::Unknown(err.into().to_string())
-      }
+  // src/app/api/meeting/route.ts:51-56 (pattern repeated in all API routes)
+  if (axios.isAxiosError(error)) {
+    const status = error.response?.status || 500;
+    const errorMessage = error.response?.data?.message
+      || error.message               // <-- raw axios error message
+      || "Failed to fetch meeting list";
+    return NextResponse.json(
+      { error: errorMessage },       // <-- forwarded to client
+      { status }
+    );
   }
-Judge: CONFIRMED — The `From<E>` blanket impl converts all errors (including
-  database errors, serialization errors, blockchain RPC errors) into
-  `AppError::Unknown` which returns the raw error message to the client. While
-  `ExecSqlFailed` correctly hides the detail, `Unknown` does not.
-Remediation: Replace dynamic error messages in client responses with generic
-  messages (e.g., "Internal server error") and log the detailed error server-side
-  using `error!()` or `tracing::error!()`. Return only a correlation/request ID
-  to the client for debugging.
+
+  // src/app/api/notion/route.ts:51-56 — Notion API error messages forwarded
+  const message = lastErr instanceof Error ? lastErr.message : "notion error";
+  return NextResponse.json(
+    { error: message },              // <-- raw Notion API error to client
+    { status: 502 }
+  );
+Judge: CONFIRMED — All 6 API route handlers follow the same pattern of forwarding
+  raw error.message to the client. While NEXT_PUBLIC_API_ADDRESS is already a
+  public environment variable, the backend may return error messages containing
+  database details, internal service names, or stack traces that should not be
+  exposed.
+Remediation: Return generic error messages to the client (e.g., "Service
+  unavailable") and log the detailed error server-side. Use the existing logger
+  to capture the full error for debugging while returning only a sanitized
+  message to the client response.
 Reference: references/information_disclosure.md
-```
-
-```
-[LOW] VULN-003 — Unbounded Pagination Limit  [CONFIRMED]
-File: src/api/reply.rs:31, src/api/like.rs:31, src/api/proposal.rs:39
-Description: Multiple query structs accept a `limit: u64` field from user input
-  without any maximum bound validation, allowing clients to request arbitrarily
-  large result sets from the database.
-Impact: An attacker can set `limit` to `u64::MAX` to force the database to attempt
-  returning all rows, consuming excessive database CPU, memory, and network bandwidth.
-  Combined with the 5-connection database pool limit, this can degrade service for
-  all users.
-Evidence:
-  // src/api/reply.rs:25-37
-  pub struct ReplyQuery {
-      pub limit: u64,  // no #[validate(range(max = ...))]
-  }
-
-  // src/api/like.rs:25-37
-  pub struct LikeQuery {
-      pub limit: u64,  // no #[validate(range(max = ...))]
-  }
-
-  // src/api/proposal.rs:33-47
-  pub struct ProposalQuery {
-      pub limit: u64,  // no #[validate(range(max = ...))]
-  }
-
-  // Compare with properly bounded pagination in vote.rs:
-  pub struct ListSelfQuery {
-      #[validate(range(min = 1))]
-      pub per_page: u64,  // has min but no max
-  }
-Judge: CONFIRMED — The `limit` field is passed directly to `.limit(query.limit)`
-  in the Sea-Query builder. The TimeoutLayer (10s) partially mitigates impact but
-  a single slow query can block one of only 5 database pool connections.
-Remediation: Add `#[validate(range(min = 1, max = 100))]` to all `limit` and
-  `per_page` fields. Apply a server-side cap (e.g., `query.limit.min(100)`) before
-  passing to the query builder as a defense-in-depth measure.
-Reference: references/denial_of_service.md
-```
-
-```
-[LOW] VULN-004 — Race Condition in Vote Meta Creation  [LIKELY]
-File: src/api/mod.rs:216-258
-Description: The `create_vote_tx` function performs a non-atomic check-then-insert
-  for VoteMeta records. Two concurrent requests for the same proposal can both pass
-  the existence check and create duplicate VoteMeta entries.
-Impact: Duplicate VoteMeta entries for the same proposal and state can cause
-  inconsistency in the voting process. The on-chain settlement layer mitigates
-  financial risk, but the application layer may display incorrect vote status
-  or allow multiple vote transactions to be initiated for the same proposal vote.
-Evidence:
-  // src/api/mod.rs:229-250
-  let vote_meta_row = if let Ok(vote_meta_row) =
-      sqlx::query_as_with::<_, VoteMetaRow, _>(&sql, value)
-          .fetch_one(&state.db)
-          .await
-  {
-      vote_meta_row          // Path A: existing row found
-  } else {
-      // ...
-      vote_meta_row.id = VoteMeta::insert(&state.db, &vote_meta_row).await?;
-      vote_meta_row          // Path B: new row created
-  };
-
-  // No UNIQUE constraint on (proposal_uri, proposal_state) in VoteMeta table.
-  // No SELECT ... FOR UPDATE or advisory lock to prevent concurrent creation.
-Judge: LIKELY — The race window exists between the SELECT and INSERT. While the
-  on-chain blockchain settlement layer prevents actual double-voting, duplicate
-  VoteMeta records could cause confusing UX and incorrect vote tallying in the
-  application layer. Exploitation requires concurrent requests which is feasible
-  but impact is bounded by the blockchain settlement.
-Remediation: Add a UNIQUE constraint on `(proposal_uri, proposal_state)` in the
-  VoteMeta table, or use `INSERT ... ON CONFLICT` (upsert) to atomically handle
-  the create-or-fetch pattern. Alternatively, use `SELECT ... FOR UPDATE` within
-  a database transaction.
-Reference: references/race_conditions.md
 ```
 
 ## Informational
 
 ```
-[INFO] VULN-005 — Permissive CORS Configuration
-File: src/main.rs:203
-Description: The application uses `CorsLayer::permissive()` which allows requests
-  from any origin with any headers and methods.
-Impact: Any website can make cross-origin requests to and read responses from
-  this API. Since the API uses signature-based authentication (not cookie-based),
-  this does not enable CSRF attacks. All read endpoints are public by design.
-  However, the permissive policy means any third-party website can programmatically
-  query the API on behalf of its visitors.
+[INFO] VULN-005 — Debug Transaction Tool Accessible in Production
+File: src/app/[locale]/debug/send-tx/page.tsx
+Description: A debug transaction tool page is present at /[locale]/debug/send-tx
+  that allows constructing and sending arbitrary CKB transactions with custom
+  outputsData. There is no access control or authentication check on this page.
+Impact: In a production deployment, this page allows any authenticated wallet
+  user to send arbitrary transactions and update vote meta transaction hashes
+  on the server. While this requires wallet connection and signing, it provides
+  a convenient interface for transaction manipulation that should not be
+  available in production.
 Evidence:
-  // src/main.rs:203
-  .layer(CorsLayer::permissive())
-Judge: This is appropriate for a public DAO governance API designed to be consumed
-  by any frontend. The signature-based authentication model (DID ECDSA signatures
-  in request bodies) is not vulnerable to CSRF regardless of CORS policy. Noted
-  as informational for documentation purposes.
-Remediation: If the API is intended to be consumed only from known frontends,
-  replace `CorsLayer::permissive()` with an explicit allowlist of origins.
-  Otherwise, document the permissive CORS policy as an intentional design decision.
-Reference: references/csrf.md
+  // src/app/[locale]/debug/send-tx/page.tsx — no auth check
+  export default function TransactionDebugTool() {
+    // ... allows arbitrary outputsData input and transaction sending
+    // Also calls updateVoteMetaTxHash with arbitrary voteMetaId
+  }
+Judge: The page requires wallet connection to function, so it cannot be exploited
+  without an authenticated wallet. However, it provides a convenient tool for
+  manipulating transactions that is clearly intended for development use only.
+  The middleware.ts does not exclude this route, so it is accessible in production.
+Remediation: Either:
+  1. Remove the debug page from production builds using Next.js environment
+     checks or conditional routing.
+  2. Add authentication/authorization checks (admin-only access).
+  3. Move to a separate development-only tool outside the main application.
+Reference: references/information_disclosure.md
 ```
 
 ## Unverifiable Findings
@@ -214,30 +254,44 @@ _None._
 
 ## Remediation Priority
 
-1. **VULN-001 (Memory Leak DoS)** — Remove `Box::leak` from error handling. This is the highest priority as it enables unauthenticated remote denial of service with trivial exploitation effort.
-2. **VULN-002 (Information Disclosure)** — Replace verbose error messages in client responses with generic messages and log details server-side.
-3. **VULN-003 (Unbounded Pagination)** — Add maximum bound validation to all `limit`/`per_page` query parameters across all API endpoints.
-4. **VULN-004 (Race Condition)** — Add a UNIQUE constraint or use atomic upsert for VoteMeta creation.
-5. **VULN-005 (Permissive CORS)** — Document as intentional or restrict to known frontends.
+1. **VULN-001 (Signing Key in localStorage)** — Encrypt the signing key at rest using the existing AES-GCM encryption infrastructure. This is the highest priority as it affects every user and the signing key cannot be rotated without on-chain account recreation.
+2. **VULN-003 (Weak QR Code PIN)** — Encrypt QR code data with AES-GCM using a stronger password. This directly exposes private keys to physical proximity attacks.
+3. **VULN-002 (XSS Pattern Inconsistency)** — Apply DOMPurify inline at the render site and remove 'style' from allowed attributes. While the current code path is safe, the fragile pattern risks regression.
+4. **VULN-004 (Error Message Forwarding)** — Replace raw error forwarding with generic messages in all API route handlers.
+5. **VULN-005 (Debug Page)** — Remove or gate the debug transaction tool for production deployments.
 
 ---
 
 ## Appendix: Analysis Summary
 
 ### Technology Stack
-- **Language**: Rust (edition 2024), `unsafe_code = "forbid"`
-- **Web Framework**: Axum (via `common_x::restful`)
-- **Database**: PostgreSQL via SQLx + Sea-Query (parameterized query builder)
-- **HTTP Client**: reqwest (for outbound API calls to indexers and PDS)
-- **Authentication**: DID-based ECDSA signature verification (k256)
-- **Blockchain**: CKB (Nervos Network) SDK for on-chain vote settlement
-- **Protocol**: AT Protocol (atrium-api) for social data relay
+- **Framework**: Next.js 15.5.9 with React 19.1.0, TypeScript 5
+- **Runtime**: Node.js (server-side API routes) + Browser (client-side SPA)
+- **Authentication**: Secp256k1 ECDSA key-pair via @atproto/crypto, session-based JWT via web5-api/AtpAgent
+- **HTTP Client**: Axios (client→Next.js API routes→backend)
+- **Blockchain**: CKB (Nervos Network) via @ckb-ccc/core, @ckb-ccc/connector-react
+- **Identity**: AT Protocol (atproto) with DID:CKB identifiers
+- **Sanitization**: DOMPurify 3.3.1 for HTML sanitization
+- **Encryption**: Web Crypto API (AES-GCM + PBKDF2) for DID export
+- **State**: Zustand for client-side state management
 
 ### Areas Analyzed
-- All 49 source files across `src/api/`, `src/lexicon/`, `src/scheduler/`, `src/relayer/`
-- SQL injection: All queries use Sea-Query + SQLx parameterized bindings. `Expr::cust_with_values` is used correctly with `$N` placeholders for all user inputs. **No SQL injection found.**
-- SSRF: Outbound HTTP targets (`pds`, `indexer_*_url`) are operator-configured via CLI flags. User input only controls path segments or query parameters on trusted internal services. **No SSRF found.**
-- XSS: Pure REST/JSON API with no HTML rendering. Not applicable.
-- RCE: `unsafe_code = "forbid"` in Cargo.toml. No shell execution, `eval`, or deserialization of untrusted formats. **No RCE found.**
-- Authentication: Write endpoints consistently require DID-based ECDSA signature verification with 5-minute timestamp window. Ownership and admin checks are applied where appropriate.
-- Secrets: No hardcoded credentials. Database URL passed via CLI flag and environment variable. API documentation gated behind opt-in `--apidoc` flag.
+- All 8 Next.js API routes (server-side handlers)
+- All client-side API definitions in src/server/
+- Authentication and session management (PDS client, session wrapper)
+- Cryptographic key generation, storage, and usage
+- All `dangerouslySetInnerHTML` sinks (14 total across 7 components)
+- DOMPurify sanitization configuration consistency
+- Middleware and routing security
+- Export/import flows for DID credentials
+- Debug and development tooling
+
+### Clean Areas
+- **SQL Injection**: Not applicable — the frontend does not directly access databases. All data access goes through the backend API via parameterized HTTP requests.
+- **XSS (general)**: Excellent hygiene — 13 of 14 `dangerouslySetInnerHTML` sinks are properly sanitized with DOMPurify using restrictive ALLOWED_TAGS and ALLOWED_ATTR configurations.
+- **SSRF**: API routes construct backend URLs using a server-configured base URL (NEXT_PUBLIC_API_ADDRESS). User input only controls query parameters (did, page, per_page), never the host or path base. URLSearchParams properly encodes parameter values.
+- **CSRF**: Not applicable — the application uses Bearer token authentication (JWT) via Authorization headers, not cookies. Session-based authentication is managed through the PDS client's session manager.
+- **Open Redirect**: The middleware redirect only uses locale prefixes from a hardcoded allowlist. The `window.open` call in ProposalTimeline validates URLs with `new URL()` and only allows http/https protocols.
+- **Path Traversal**: The only file system access is reading `public/chart.csv` via a hardcoded path using `join(process.cwd(), "public", "chart.csv")` — no user input in file paths.
+- **Encryption**: The AES-GCM + PBKDF2 (100,000 iterations) implementation in encrypt.ts is correctly implemented with random salt and IV for DID file export.
+- **RCE**: No `eval()`, `Function()`, or shell execution found in the codebase.
