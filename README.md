@@ -4,6 +4,54 @@ A general-purpose **Static Application Security Testing (SAST) skill** for LLM-b
 
 ---
 
+## Usage as GitHub Copilot Custom Agent
+
+This project ships a ready-to-use **GitHub Copilot Custom Agent** that autonomously performs
+a full SAST scan on any repository — no installation, no code.
+
+### Method 1 — Per-repository
+
+Copy the agent definition and reference files into the target repository:
+
+```bash
+git clone https://github.com/gpBlockchain/llm-sast-scanner.git
+cd <your-target-repo>
+mkdir -p .github/agents
+cp ../llm-sast-scanner/.github/agents/sast-scanner.md .github/agents/
+cp -r ../llm-sast-scanner/references/ .
+git add .github/agents/sast-scanner.md references/
+git commit -m "chore: add sast-scanner Copilot Custom Agent"
+```
+
+Then assign the agent in Copilot Chat and ask: *"Do a full SAST scan and write
+`sast_report.md`."*
+
+### Method 2 — Organization-wide
+
+Place the agent file in your organization's `.github-private` repository under `/agents/`
+so it becomes available across all repos in the org automatically:
+
+```
+.github-private/
+└── agents/
+    └── sast-scanner.md
+```
+
+> **Note:** Reference files must still be accessible. Either commit `references/` to each
+> target repo, or instruct the agent to read them from this repository using the `github/*`
+> tool with the full path `gpBlockchain/llm-sast-scanner/references/<file>.md`.
+
+### Method 3 — Copilot Chat (on-demand)
+
+1. Open Copilot Chat in VS Code or GitHub.com.
+2. Select the **sast-scanner** agent from the agent picker.
+3. Ask it to scan: *"Security audit this repo and produce a sast_report.md."*
+
+The agent will autonomously explore the codebase, load the relevant vulnerability references,
+perform Source→Sink taint analysis, run Judge verification, and write the report.
+
+---
+
 ## What It Does
 
 This skill gives an LLM agent a structured, evidence-based workflow for finding security vulnerabilities in source code:
